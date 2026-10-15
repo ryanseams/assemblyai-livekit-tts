@@ -28,7 +28,8 @@ import asyncio
 import base64
 import json
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from typing import Literal
 from urllib.parse import urlencode
 
 import aiohttp
@@ -70,20 +71,39 @@ class _TTSOptions:
     word_timestamps: bool
     api_key: str
     base_url: str
+    voice_id: str | None = None
+    model_id: str | None = None
+    auth: Literal["header", "query"] = "header"
+    extra_params: dict[str, str] = field(default_factory=dict)
 
     @property
     def mime_type(self) -> str:
         return _MIME_TYPES.get(self.encoding, "audio/pcm")
 
     def ws_url(self) -> str:
-        params = {
-            "voice": self.voice,
+        params: dict[str, str | int] = {}
+        # A custom (e.g. cloned) voice is addressed by `voice_id` instead of a
+        # preset `voice` name.
+        if self.voice_id:
+            params["voice_id"] = self.voice_id
+        else:
+            params["voice"] = self.voice
+        if self.model_id:
+            params["model_id"] = self.model_id
+        params.update({
             "language": self.language,
             "sample_rate": self.sample_rate,
             "encoding": self.encoding,
             "word_boundaries": "true" if self.word_timestamps else "false",
-        }
+        })
+        params.update(self.extra_params)
+        if self.auth == "query":
+            params["token"] = self.api_key
         return f"{self.base_url}?{urlencode(params)}"
+
+    def ws_headers(self) -> dict[str, str]:
+        # Pass the key raw; it is not a Bearer token.
+        return {"Authorization": self.api_key} if self.auth == "header" else {}
 
 
 class TTS(tts.TTS):
@@ -91,12 +111,16 @@ class TTS(tts.TTS):
         self,
         *,
         voice: str = DEFAULT_VOICE,
+        voice_id: str | None = None,
+        model_id: str | None = None,
         language: str = DEFAULT_LANGUAGE,
         encoding: TTSEncoding = "pcm_s16le",
         sample_rate: int = 24000,
         word_timestamps: bool = False,
         api_key: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
+        auth: Literal["header", "query"] = "header",
+        extra_params: dict[str, str] | None = None,
         http_session: aiohttp.ClientSession | None = None,
         tokenizer: NotGivenOr[tokenize.SentenceTokenizer] = NOT_GIVEN,
         text_pacing: tts.SentenceStreamPacer | bool = False,
@@ -105,7 +129,12 @@ class TTS(tts.TTS):
 
         Args:
             voice: Preset voice name, e.g. "jane". Voice and language must agree;
-                see https://assemblyai.com/docs/tts/voices.
+                see https://assemblyai.com/docs/tts/voices. Ignored when
+                `voice_id` is set.
+            voice_id: ID of a custom (e.g. cloned) voice. Sent as the `voice_id`
+                query parameter in place of `voice`.
+            model_id: TTS model checkpoint, e.g. "assemblyai-tts-mul-4b-2026-10-07".
+                Omitted (server default) when unset.
             language: Spoken language, e.g. "english".
             encoding: Output audio encoding. Defaults to "pcm_s16le" (linear PCM),
                 which is the only encoding decoded as raw audio by LiveKit.
@@ -115,6 +144,11 @@ class TTS(tts.TTS):
             api_key: AssemblyAI API key. Falls back to the ASSEMBLYAI_API_KEY
                 environment variable.
             base_url: WebSocket endpoint. Defaults to the global streaming-tts host.
+                Point it at a sandbox, e.g.
+                "wss://streaming-tts.sandbox000.assemblyai-labs.com/v1/ws".
+            auth: "header" sends the key in the Authorization header; "query" sends
+                it as the `token` query parameter, as the sandbox endpoints expect.
+            extra_params: Additional query parameters appended to the socket URL.
             http_session: An existing aiohttp session to reuse. One is created from
                 the LiveKit HTTP context if omitted.
             tokenizer: Sentence tokenizer used to split streamed LLM text into
@@ -153,6 +187,10 @@ class TTS(tts.TTS):
             word_timestamps=word_timestamps,
             api_key=aai_api_key,
             base_url=base_url,
+            voice_id=voice_id,
+            model_id=model_id,
+            auth=auth,
+            extra_params=dict(extra_params or {}),
         )
         self._session = http_session
         self._sentence_tokenizer = (
@@ -166,7 +204,7 @@ class TTS(tts.TTS):
 
     @property
     def model(self) -> str:
-        return "streaming-tts"
+        return self._opts.model_id or "streaming-tts"
 
     @property
     def provider(self) -> str:
@@ -176,11 +214,14 @@ class TTS(tts.TTS):
         self,
         *,
         voice: NotGivenOr[str] = NOT_GIVEN,
+        voice_id: NotGivenOr[str | None] = NOT_GIVEN,
         language: NotGivenOr[str] = NOT_GIVEN,
     ) -> None:
         """Update the voice and/or language used for subsequent synthesis."""
         if is_given(voice):
             self._opts.voice = voice
+        if is_given(voice_id):
+            self._opts.voice_id = voice_id
         if is_given(language):
             self._opts.language = language
 
@@ -195,11 +236,8 @@ class TTS(tts.TTS):
         """Open a socket and consume the first frame (`Begin`, or `Error` on reject)."""
         session = self._ensure_session()
         try:
-            # Pass the key raw; it is not a Bearer token.
             ws = await asyncio.wait_for(
-                session.ws_connect(
-                    opts.ws_url(), headers={"Authorization": opts.api_key}
-                ),
+                session.ws_connect(opts.ws_url(), headers=opts.ws_headers()),
                 timeout,
             )
         except asyncio.TimeoutError:
@@ -210,7 +248,8 @@ class TTS(tts.TTS):
                 message=e.message, status_code=e.status, request_id=None, body=None
             ) from None
         except Exception as e:
-            # Transport errors can carry credentials in URLs.
+            # Transport errors can carry credentials in URLs (and the key itself
+            # when auth="query").
             raise APIConnectionError(type(e).__name__) from None
 
         try:
